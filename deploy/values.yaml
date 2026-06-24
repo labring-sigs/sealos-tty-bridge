@@ -4,8 +4,8 @@ nameOverride: tty-bridge-system
 fullnameOverride: tty-bridge-system
 
 image:
-  repository: ghcr.io/labring-sigs/sealos-tty-agent
-  tag: sha-028d430
+  repository: ghcr.io/labring-sigs/sealos-tty-bridge
+  tag: latest
 
 imagePullPolicy: Always
 imagePullSecrets: []
