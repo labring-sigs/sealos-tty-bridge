@@ -1,8 +1,9 @@
 import type { V1Status } from '@kubernetes/client-node'
+import type { Readable, Writable } from 'node:stream'
 import type { ServerFrame } from '../packages/protocol-client/src/protocol.ts'
 import type { ExecTarget } from './utils/http-utils.ts'
 import type { WsStreams } from './utils/ws-streams.ts'
-import { pipeline } from 'node:stream'
+import { PassThrough, pipeline } from 'node:stream'
 import * as k8s from '@kubernetes/client-node'
 import { safeJsonStringify, toErrorMessage } from '../packages/protocol-client/src/protocol.ts'
 
@@ -24,6 +25,22 @@ const COMMON_SHELL_COMMANDS: ReadonlyArray<ReadonlyArray<string>> = [
 	['ash', '-i'],
 ]
 
+type K8sWs = { close: () => void }
+
+type ExecLike = {
+	exec: (
+		namespace: string,
+		podName: string,
+		containerName: string,
+		command: string[],
+		stdout: Writable | null,
+		stderr: Writable | null,
+		stdin: Readable | null,
+		tty: boolean,
+		statusCallback?: (status: V1Status) => void,
+	) => Promise<K8sWs>
+}
+
 function isCommandNotFoundError(message: string): boolean {
 	const m = message.toLowerCase()
 	return (
@@ -32,6 +49,86 @@ function isCommandNotFoundError(message: string): boolean {
 		|| m.includes('not found')
 		|| m.includes('stat /')
 	)
+}
+
+function statusMessage(status: V1Status): string {
+	return typeof (status as unknown as { message?: unknown })?.message === 'string'
+		? (status as unknown as { message: string }).message
+		: ''
+}
+
+function isFailureStatus(status: V1Status): boolean {
+	return (status as unknown as { status?: unknown })?.status === 'Failure'
+}
+
+function shellProbeCommand(cmd: ReadonlyArray<string>): string[] {
+	return [cmd[0] ?? '', '-c', 'exit 0']
+}
+
+async function probeCommand(options: {
+	exec: ExecLike
+	target: ExecTarget
+	cmd: ReadonlyArray<string>
+}): Promise<boolean> {
+	return new Promise((resolve, reject) => {
+		const stdout = new PassThrough()
+		options.exec.exec(
+			options.target.namespace,
+			options.target.pod,
+			options.target.container ?? '',
+			shellProbeCommand(options.cmd),
+			stdout,
+			stdout,
+			null,
+			true,
+			(status) => {
+				if (isFailureStatus(status)) {
+					const message = statusMessage(status)
+					if (isCommandNotFoundError(message)) {
+						resolve(false)
+						return
+					}
+					reject(new Error(message || 'exec failed'))
+					return
+				}
+				resolve(true)
+			},
+		).catch((err: unknown) => {
+			if (isCommandNotFoundError(toErrorMessage(err))) {
+				resolve(false)
+				return
+			}
+			reject(err)
+		})
+	})
+}
+
+export async function execFirstWorkingCommand(options: {
+	exec: ExecLike
+	target: ExecTarget
+	candidates: ReadonlyArray<ReadonlyArray<string>>
+	stdout: Writable
+	stdin: Readable
+	statusCallback: (status: V1Status) => void
+}): Promise<K8sWs | undefined> {
+	const shouldFallback = options.candidates.length > 1
+
+	for (const cmd of options.candidates) {
+		if (shouldFallback && !(await probeCommand({ exec: options.exec, target: options.target, cmd })))
+			continue
+
+		return options.exec.exec(
+			options.target.namespace,
+			options.target.pod,
+			options.target.container ?? '',
+			[...cmd],
+			options.stdout,
+			options.stdout,
+			options.stdin,
+			true,
+			options.statusCallback,
+		)
+	}
 }
 
 export type WsConnection = {
@@ -186,36 +283,27 @@ export async function startExecIfNeeded(
 		const candidates = custom ? [custom] : COMMON_SHELL_COMMANDS
 
 		let k8sWs: { close: () => void } | undefined
-		let lastError = ''
 
-		for (const cmd of candidates) {
-			try {
-				logInfo('exec command selected', { id: conn.id, cmd })
-				k8sWs = await exec.exec(
-					sess.target.namespace,
-					sess.target.pod,
-					sess.target.container ?? '',
-					[...cmd],
-					stdout,
-					stdout,
-					sess.streams.stdin,
-					true,
-					statusCallback,
-				) as unknown as { close: () => void }
-				break
-			}
-			catch (err: unknown) {
-				lastError = toErrorMessage(err)
-				// If user explicitly set command, do not fallback.
-				if (custom) {
-					throw err
-				}
-				// Only fallback on typical "command not found" errors.
-				if (!isCommandNotFoundError(lastError))
-					throw err
+		try {
+			k8sWs = await execFirstWorkingCommand({
+				exec: exec as ExecLike,
+				target: sess.target,
+				candidates,
+				stdout,
+				stdin: sess.streams.stdin,
+				statusCallback,
+			})
+		}
+		catch (err: unknown) {
+			// If user explicitly set command, do not fallback.
+			if (custom)
+				throw err
 
-				logWarn('exec shell not found, trying next', { id: conn.id, cmd, error: lastError })
-			}
+			// Only fallback on typical "command not found" errors.
+			if (!isCommandNotFoundError(toErrorMessage(err)))
+				throw err
+
+			logWarn('exec shell not found', { id: conn.id, error: toErrorMessage(err) })
 		}
 
 		if (!k8sWs) {
